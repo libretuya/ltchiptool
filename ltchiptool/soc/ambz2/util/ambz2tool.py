@@ -5,7 +5,7 @@ from hashlib import sha256
 from logging import debug, warning
 from math import ceil
 from time import time
-from typing import BinaryIO, Generator, List, Optional
+from typing import BinaryIO, Callable, Generator, List, Optional
 
 import click
 from serial import Serial
@@ -13,6 +13,8 @@ from xmodem import XMODEM
 
 from ltchiptool.util import log_copy_setup, verbose
 from ltchiptool.util.intbin import align_down
+
+_T_ProgressCB = Callable[[int], None] | None
 
 
 class AmbZ2FlashMode(IntEnum):
@@ -137,7 +139,12 @@ class AmbZ2Tool:
 
     def ping(self) -> None:
         self.command("ping")
-        assert self.read(4) == b"ping"
+        resp = self.read(4)
+        if resp != b"ping":
+            raise RuntimeError(f"incorrect ping response: {resp!r}")
+
+    def disconnect(self) -> None:
+        self.command("disc")
 
     def link(self) -> None:
         end = time() + self.link_timeout
@@ -157,7 +164,10 @@ class AmbZ2Tool:
         self.s.baudrate = baudrate
         # wait up to 1 second for OK response
         self.push_timeout(1.0)
-        assert self.read() == b"OK"
+        resp = self.read()
+        if resp != b"OK":
+            raise RuntimeError(f"baud rate change not OK: {resp!r}")
+
         self.pop_timeout()
         # link again to make sure it still works
         self.link()
@@ -286,7 +296,19 @@ class AmbZ2Tool:
             raise RuntimeError(f"Unexpected response: {response}")
         return response[6 : 6 + 32]
 
-    def flash_transmit(self, stream: Optional[BinaryIO], offset: int) -> None:
+    def _build_callback(
+        self, progress: _T_ProgressCB
+    ) -> Optional[Callable[[int, int, int], None]]:
+        if not progress:
+            return None
+
+        pkt_size = 1024 if self.xm.mode == "xmodem1k" else 128
+
+        return lambda total_packets, success, error: progress(pkt_size * success)
+
+    def flash_transmit(
+        self, stream: Optional[BinaryIO], offset: int, progress: _T_ProgressCB = None
+    ) -> None:
         # set the flash_mode
         self.flash_init(configure=False)
 
@@ -299,14 +321,36 @@ class AmbZ2Tool:
         if not stream:
             debug("XMODEM: starting empty transmission")
             # wait for NAK
-            assert self.read(1) == b"\x15"
+            resp = self.read(1)
+            if resp != b"\x15":
+                raise RuntimeError(f"expected NAK, got {resp!r}")
+
             # abort using CAN
             self.xm.abort()
             self.flush()
             # wait for CAN response
-            assert self.read(3) == b"\x18ER"
+            resp = self.read(3)
+            if resp != b"\x18ER":
+                raise RuntimeError(f"expected CAN, got {resp!r}")
         else:
             debug(f"XMODEM: transmitting to 0x{offset:X}")
+            if not self.xm.send(stream, callback=self._build_callback(progress)):
+                raise RuntimeError("XMODEM transmission failed")
+
+        self.pop_timeout()
+        self.link()
+
+    def ram_transmit(
+        self, stream: BinaryIO, offset: int, progress: _T_ProgressCB = None
+    ) -> None:
+        # increase timeout to read XMODEM bytes (RTL processes requests every ~1.0s)
+        self.push_timeout(2.0)
+
+        self.command(f"fwdram {offset:x}")
+
+        debug(f"XMODEM: transmitting to 0x{offset:X}")
+        if not self.xm.send(stream, callback=self._build_callback(progress)):
+            raise RuntimeError("XMODEM transmission failed")
 
         self.pop_timeout()
         self.link()
@@ -375,6 +419,54 @@ class AmbZ2Tool:
                         f"{hash_expected.hex()}, calculated: {hash_final.hex()}"
                     )
                 sha_size = 0
+
+    def memory_write(
+        self,
+        offset: int,
+        stream: BinaryIO,
+        use_flash: bool,
+        hash_check: bool = True,
+        chunk_size: int = 32 * 1024,
+        progress: _T_ProgressCB = None,
+    ) -> Generator[int, None, None]:
+        if not use_flash:
+            # can only check SHA of flash
+            hash_check = False
+
+        base = stream.tell()
+        length = None
+        hash_expected = None
+
+        if hash_check:
+            # on py >= 3.11 use:
+            # sha = hashlib.file_digest(stream, sha256)
+            sha = sha256()
+            while chunk := stream.read(chunk_size):
+                sha.update(chunk)
+
+            hash_expected = sha.digest()
+            length = stream.tell()
+            # rewind stream
+            stream.seek(base)
+
+        if use_flash:
+            self.flash_transmit(stream, offset, progress=progress)
+        else:
+            self.ram_transmit(stream, offset, progress=progress)
+
+        # required to make this a generator and signal completion to the progress bar
+        yield stream.tell()
+
+        if hash_expected:
+            assert length
+            debug(f"hash check: start={offset:#X}, count={length:#X}")
+            hash_final = self.flash_read_hash(offset, length)
+            if hash_final != hash_expected:
+                raise ValueError(
+                    f"Chip SHA256 value does not match expected value "
+                    f"(at {offset:#X}+{length:#X}). "
+                    f"Expected: {hash_expected.hex()}, calculated: {hash_final.hex()}"
+                )
 
 
 @click.command(
